@@ -44,21 +44,21 @@ use tokio::{sync::RwLock, time::Duration};
 /// let txn = client.begin_optimistic().await.unwrap();
 /// # });
 /// ```
-pub struct Transaction {
+pub struct Transaction<PdC: PdClient = PdRpcClient> {
     status: Arc<RwLock<TransactionStatus>>,
     timestamp: Timestamp,
     buffer: Buffer,
     bg_worker: ThreadPool,
-    rpc: Arc<PdRpcClient>,
+    rpc: Arc<PdC>,
     options: TransactionOptions,
     is_heartbeat_started: bool,
 }
 
-impl Transaction {
+impl<PdC: PdClient> Transaction<PdC> {
     pub(crate) fn new(
         timestamp: Timestamp,
         bg_worker: ThreadPool,
-        rpc: Arc<PdRpcClient>,
+        rpc: Arc<PdC>,
         options: TransactionOptions,
     ) -> Transaction {
         let status = if options.read_only {
@@ -752,26 +752,23 @@ impl Transaction {
     }
 }
 
-impl Drop for Transaction {
+impl<PdC: PdClient> Drop for Transaction<PdC> {
     fn drop(&mut self) {
-        {
-            if std::thread::panicking() {
-                return;
-            }
-            let status = futures::executor::block_on(self.status.read());
-            if *status == TransactionStatus::Active {
-                match self.options.check_level {
-                    CheckLevel::Panic => {
-                        panic!("Dropping an active transaction. Consider commit or rollback it.")
-                    }
-                    CheckLevel::Warn => {
-                        warn!("Dropping an active transaction. Consider commit or rollback it.")
-                    }
-                    CheckLevel::None => {}
+        if std::thread::panicking() {
+            return;
+        }
+        let status = futures::executor::block_on(self.status.write());
+        if *status == TransactionStatus::Active {
+            match self.options.check_level {
+                CheckLevel::Panic => {
+                    panic!("Dropping an active transaction. Consider commit or rollback it.")
                 }
+                CheckLevel::Warn => {
+                    warn!("Dropping an active transaction. Consider commit or rollback it.")
+                }
+                CheckLevel::None => {}
             }
         }
-        let mut status = futures::executor::block_on(self.status.write());
         *status = TransactionStatus::Dropped;
     }
 }
@@ -916,18 +913,18 @@ const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// The committer implements `prewrite`, `commit` and `rollback` functions.
 #[derive(new)]
-struct Committer {
+struct Committer<PdC: PdClient = PdRpcClient> {
     primary_key: Option<Key>,
     mutations: Vec<kvrpcpb::Mutation>,
     start_version: Timestamp,
     bg_worker: ThreadPool,
-    rpc: Arc<PdRpcClient>,
+    rpc: Arc<PdC>,
     options: TransactionOptions,
     #[new(default)]
     undetermined: bool,
 }
 
-impl Committer {
+impl<PdC: PdClient> Committer<PdC> {
     async fn commit(mut self) -> Result<Option<Timestamp>> {
         let min_commit_ts = self.prewrite().await?;
         fail_point!("after-prewrite");
@@ -1123,4 +1120,50 @@ enum TransactionStatus {
     StartedRollback,
     /// The transaction has been dropped.
     Dropped,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        mock::{MockKvClient, MockPdClient},
+        Transaction, TransactionOptions,
+    };
+    use futures::executor::ThreadPool;
+    use std::{
+        any::Any,
+        io,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use tikv_client_proto::{kvrpcpb, pdpb::Timestamp};
+
+    #[test]
+    fn test_optimistic_heartbeat() -> Result<(), io::Error> {
+        let mut heartbeats = AtomicUsize::new(0);
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            |req: &dyn Any| {
+                if let Some(heartbeat) = req.downcast_mut::<kvrpcpb::TxnHeartBeatRequest>() {
+                    heartbeats.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(kvrpcpb::TxnHeartBeatResponse::default()) as Box<dyn Any>)
+                } else {
+                    Ok(Box::new(kvrpcpb::ResolveLockResponse::default()) as Box<dyn Any>)
+                }
+            },
+        )));
+        let key1 = "key1".to_owned();
+        let bg_worker = ThreadPool::new()?;
+        let heartbeat_txn = Transaction::new(
+            Timestamp::default(),
+            bg_worker,
+            pd_client,
+            TransactionOptions::new_optimistic(),
+        );
+        assert!(heartbeats.load(Ordering::SeqCst) > 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pessimistic_heartbeat() {}
 }
