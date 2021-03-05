@@ -766,6 +766,7 @@ impl<PdC: PdClient> Drop for Transaction<PdC> {
                 CheckLevel::Warn => {
                     warn!("Dropping an active transaction. Consider commit or rollback it.")
                 }
+
                 CheckLevel::None => {}
             }
         }
