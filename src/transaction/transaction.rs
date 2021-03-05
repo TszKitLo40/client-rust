@@ -928,7 +928,12 @@ struct Committer<PdC: PdClient = PdRpcClient> {
 impl<PdC: PdClient> Committer<PdC> {
     async fn commit(mut self) -> Result<Option<Timestamp>> {
         let min_commit_ts = self.prewrite().await?;
-        fail_point!("after-prewrite");
+        if (|| {
+            fail_point!("after-prewrite", |_| true);
+            false
+        })() {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
 
         // If we didn't use 1pc, prewrite will set `try_one_pc` to false.
         if self.options.try_one_pc {
@@ -1129,6 +1134,7 @@ mod tests {
         mock::{MockKvClient, MockPdClient},
         Transaction, TransactionOptions,
     };
+    use fail::FailScenario;
     use futures::executor::ThreadPool;
     use std::{
         any::Any,
@@ -1140,9 +1146,10 @@ mod tests {
     };
     use tikv_client_proto::{kvrpcpb, pdpb::Timestamp};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn test_optimistic_heartbeat() -> Result<(), io::Error> {
-        fail::cfg("after-prewrite", "sleep(10000)").unwrap();
+        let scenario = FailScenario::setup();
+        fail::cfg("after-prewrite", "return(true)").unwrap();
         let heartbeats = Arc::new(AtomicUsize::new(0));
         let heartbeats_cloned = heartbeats.clone();
         let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
@@ -1171,6 +1178,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         heartbeat_txn_handle.await.unwrap();
         assert!(heartbeats.load(Ordering::SeqCst) >= 1);
+        scenario.teardown();
         Ok(())
     }
 
@@ -1185,8 +1193,12 @@ mod tests {
                     return Ok(Box::new(kvrpcpb::TxnHeartBeatResponse::default()) as Box<dyn Any>);
                 } else if let Some(_prewrite) = req.downcast_ref::<kvrpcpb::PrewriteRequest>() {
                     return Ok(Box::new(kvrpcpb::PrewriteResponse::default()) as Box<dyn Any>);
-                } else if let Some(_pessimistic_lock) = req.downcast_ref::<kvrpcpb::PessimisticLockRequest>() {
-                    return Ok(Box::new(kvrpcpb::PessimisticLockResponse::default()) as Box<dyn Any>);
+                } else if let Some(_pessimistic_lock) =
+                    req.downcast_ref::<kvrpcpb::PessimisticLockRequest>()
+                {
+                    return Ok(
+                        Box::new(kvrpcpb::PessimisticLockResponse::default()) as Box<dyn Any>
+                    );
                 }
                 Ok(Box::new(kvrpcpb::CommitResponse::default()) as Box<dyn Any>)
             },
